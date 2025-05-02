@@ -70,6 +70,17 @@ def sanitize_year(y: int | None) -> int | None:
     return None
 
 
+def _same_file(src: Path, dst: Path) -> bool:
+    """
+    Return True if *dst* exists and has the same file size as *src*.
+    (Good enough for incremental backup; avoids hashing large files.)
+    """
+    try:
+        return dst.exists() and src.stat().st_size == dst.stat().st_size
+    except OSError:
+        return False
+
+
 def find_metadata_json(media: Path) -> Path | None:
     """Locate Google Photos side-car JSON for *media*, if present."""
     parent = media.parent
@@ -150,15 +161,26 @@ def file_year(path: Path) -> int | None:
     return y
 
 
-def next_non_clashing_path(dest: Path) -> Path:
-    """Append ' (1)', ' (2)' … until the path is free (bounded)."""
+def next_non_clashing_path(dest: Path, src: Path) -> Path | None:
+    """
+    * If an identical file already exists at *dest*, return **None**  → skip.
+    * If a different file exists, append  ' (1)', ' (2)' …  until a free name
+      is found.  Returns that new Path.
+    * If *dest* is free, simply returns *dest*.
+    """
     if not dest.exists():
         return dest
+
+    if _same_file(src, dest):  # identical – nothing to do
+        return None
+
     stem, suff = dest.stem, dest.suffix
     for i in range(1, MAX_DUPES + 1):
         cand = dest.with_name(f"{stem} ({i}){suff}")
         if not cand.exists():
             return cand
+        if _same_file(src, cand):  # duplicate already copied earlier
+            return None
     raise RuntimeError(f"Too many duplicates for {dest}")
 
 
@@ -166,7 +188,8 @@ def next_non_clashing_path(dest: Path) -> Path:
 def copy_one(src: Path, dest_root: Path) -> bool:
     """
     Copy *src* into its year folder.
-    Returns True on success, False on (logged) error.
+    Returns True if a copy was actually made or skipped because identical,
+    False on genuine error.
     """
     try:
         year = file_year(src) or UNKNOWN_DIR
@@ -174,9 +197,14 @@ def copy_one(src: Path, dest_root: Path) -> bool:
         with _LOCK:
             year_dir.mkdir(parents=True, exist_ok=True)
 
-        dest_path = next_non_clashing_path(year_dir / src.name)
-        shutil.copy2(src, dest_path)
-        logging.debug(f"Copied {src} → {dest_path}")
+        # decide where (or whether) to copy
+        target = next_non_clashing_path(year_dir / src.name, src)
+        if target is None:  # identical already there
+            logging.debug(f"Skip (identical): {src}")
+            return True
+
+        shutil.copy2(src, target)  # real copy
+        logging.debug(f"Copied {src} → {target}")
         return True
 
     except Exception as exc:
