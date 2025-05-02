@@ -10,7 +10,8 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ---------- constants ------------------------------------------------
+
+# ---------- constants ---------------------------------------------------------
 PHOTO_EXTS = {
     ".jpg",
     ".jpeg",
@@ -37,175 +38,173 @@ VIDEO_EXTS = {
     ".3gp",
     ".hevc",
 }
-PROGRESS_EVERY = 1000  # INFO message every N copies
-# --------------------------------------------------------------------------------
+UNKNOWN_DIR = "_unknown"  # folder for files with no valid date
+PROGRESS_EVERY = 1_000  # INFO message every N copies
+MAX_DUPES = 1_000  # safety-valve for next_non_clashing_path
+# ------------------------------------------------------------------------------
 
 try:
     from PIL import Image, ExifTags
-except ImportError:  # Pillow optional; JSON still works
+except ImportError:  # EXIF support optional
     Image = None
 
-# Map EXIF tag name → tag id
 _EXIF_DT_TAG = None
 if Image:
-    for tag_id, tag_name in ExifTags.TAGS.items():
-        if tag_name == "DateTimeOriginal":
-            _EXIF_DT_TAG = tag_id
+    for t_id, t_name in ExifTags.TAGS.items():
+        if t_name == "DateTimeOriginal":
+            _EXIF_DT_TAG = t_id
             break
-# -------------------------------------------------------------------------------
+
+_JSON_DUP_RE = re.compile(r"(.+?)\((\d+)\)$")  #  "image(1)"
+_THIS_YEAR = datetime.now(timezone.utc).year
+_YEAR_MIN, _YEAR_MAX = 1900, _THIS_YEAR + 2
+_LOCK = threading.Lock()  # mkdir synchronisation
+# ------------------------------------------------------------------------------
 
 
-# -------------------------------------------------------------------------------
-# 1. JSON helpers
-# -------------------------------------------------------------------------------
-_JSON_DUP_RE = re.compile(r"(.+?)\((\d+)\)$")  #  e.g.  "image(1)"
-
-
-def find_metadata_json(media: Path) -> Path | None:
-    """
-    Look in the same folder for the Google-Photos metadata of media.
-    Covers:
-        image.jpg      -> image.jpg.json
-        image(1).jpg   -> image.jpg(1).json
-        image (1).jpg  -> image.jpg (1).json
-    Returns the Path if found, else None.
-    """
-    parent = media.parent
-
-    # #1: straightforward "<file>.json"  -------------------------------
-    cand = parent / f"{media.name}.json"
-    if not cand.exists():
-        cand = cand.with_suffix(".JSON")
-    if cand.exists():
-        return cand
-
-    # #2: duplicate pattern "image(1).jpg" -> "image.jpg(1).json" -----
-    m = _JSON_DUP_RE.match(media.stem)
-    if m:
-        base, num = m.groups()  # image , 1
-        base = base.rstrip()  # remove trailing space (if any)
-        # preserve any space that was inside the () in original stem
-        suffix = media.suffix  # ".jpg"
-        with_no_space = parent / f"{base}{suffix}({num}).json"
-        with_space = parent / f"{base}{suffix} ({num}).json"
-        for c in (
-            with_no_space,
-            with_space,
-            with_no_space.with_suffix(".JSON"),
-            with_space.with_suffix(".JSON"),
-        ):
-            if c.exists():
-                return c
-
+# ---- helpers -----------------------------------------------------------------
+def sanitize_year(y: int | None) -> int | None:
+    """Return y only if it is in a sane range; else None."""
+    if y and _YEAR_MIN <= y <= _YEAR_MAX:
+        return y
     return None
 
 
-def year_from_google_json(json_path: Path) -> int | None:
-    """
-    Parse Google Photos JSON and return the taken year (int) if possible.
-    Prefers photoTakenTime.timestamp; falls back to creationTime.timestamp.
-    """
-    try:
-        with json_path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
+def find_metadata_json(media: Path) -> Path | None:
+    """Locate Google Photos side-car JSON for *media*, if present."""
+    parent = media.parent
 
+    # 1) normal "<file>.json" / ".JSON"
+    for ext in (".json", ".JSON"):
+        cand = parent / f"{media.name}{ext}"
+        if cand.exists():
+            return cand
+
+    # 2) duplicate pattern "image(1).jpg" → "image.jpg(1).json"
+    m = _JSON_DUP_RE.match(media.stem)
+    if m:
+        base, num = m.groups()
+        base = base.rstrip()  # trim possible space before '('
+        suffix = media.suffix
+        variants = (
+            f"{base}{suffix}({num})",
+            f"{base}{suffix} ({num})",
+        )
+        for stem in variants:
+            for ext in (".json", ".JSON"):
+                cand = parent / f"{stem}{ext}"
+                if cand.exists():
+                    return cand
+    return None
+
+
+def year_from_google_json(jpath: Path) -> int | None:
+    try:
+        with jpath.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
         ts = data.get("photoTakenTime", {}).get("timestamp") or data.get(
             "creationTime", {}
         ).get("timestamp")
         if ts:
-            # use an *aware* datetime in UTC
-            return datetime.fromtimestamp(int(ts), tz=timezone.utc).year
-    except Exception:
-        pass
+            year = datetime.fromtimestamp(int(ts), tz=timezone.utc).year
+            return sanitize_year(year)
+    except Exception as e:
+        logging.debug(f"Broken JSON in {jpath} ({e})")
     return None
 
 
-# -------------------------------------------------------------------------------
-# 2. EXIF helper (same as before)
-# -------------------------------------------------------------------------------
-def year_from_photo_exif(path: Path) -> int | None:
+def year_from_photo_exif(p: Path) -> int | None:
     if not Image:
         return None
     try:
-        with Image.open(path) as im:
+        with Image.open(p) as im:
             exif = im._getexif() or {}
-            raw = exif.get(_EXIF_DT_TAG)  # "YYYY:MM:DD HH:MM:SS"
+            raw = exif.get(_EXIF_DT_TAG)  # "YYYY:MM:DD …"
             if raw:
-                return int(raw.split(":")[0])
-    except Exception:
-        pass
+                year = int(raw.split(":")[0])
+                return sanitize_year(year)
+    except Exception as e:
+        logging.debug(f"EXIF read failed in {p} ({e})")
     return None
 
 
-# -------------------------------------------------------------------------------
-# 3. Unified year-detection
-# -------------------------------------------------------------------------------
-def file_year(path: Path) -> int:
-    """
-    Determine the year for *path* in this order:
-      1. Google-Photos JSON side-car (if present)
-      2. EXIF DateTimeOriginal  (photo only)
-      3. Filesystem modification timestamp   (fallback)
-    """
-    meta_json = find_metadata_json(path)
-    if meta_json:
-        y = year_from_google_json(meta_json)
+def file_year(path: Path) -> int | None:
+    """Return a sane year or None (→ '_unknown')."""
+    meta = find_metadata_json(path)
+    if meta:
+        y = year_from_google_json(meta)
         if y:
-            logging.debug(f"Year from JSON  ({meta_json.name}) -> {y}")
+            logging.debug(f"Year via JSON  : {y}  ({path.name})")
             return y
 
     if path.suffix.lower() in PHOTO_EXTS:
         y = year_from_photo_exif(path)
         if y:
-            logging.debug(f"Year from EXIF        -> {y}  ({path.name})")
+            logging.debug(f"Year via EXIF  : {y}  ({path.name})")
             return y
 
-    y = datetime.fromtimestamp(path.stat().st_mtime).year
-    logging.debug(f"Year from mtime       -> {y}  ({path.name})")
+    # fallback: filesystem mtime
+    y = sanitize_year(datetime.fromtimestamp(path.stat().st_mtime).year)
+    if y:
+        logging.debug(f"Year via mtime  : {y}  ({path.name})")
     return y
 
 
-# -------------------------------------------------------------------------------
-# 4. Copy helpers & worker
-# -------------------------------------------------------------------------------
 def next_non_clashing_path(dest: Path) -> Path:
+    """Append ' (1)', ' (2)' … until the path is free (bounded)."""
     if not dest.exists():
         return dest
     stem, suff = dest.stem, dest.suffix
-    for i in itertools.count(1):
+    for i in range(1, MAX_DUPES + 1):
         cand = dest.with_name(f"{stem} ({i}){suff}")
         if not cand.exists():
             return cand
+    raise RuntimeError(f"Too many duplicates for {dest}")
 
 
-def copy_one(src: Path, dest_root: Path, lock: threading.Lock):
-    year = file_year(src)
-    year_dir = dest_root / str(year)
-    with lock:
-        year_dir.mkdir(parents=True, exist_ok=True)
+# ---- worker -------------------------------------------------------------------
+def copy_one(src: Path, dest_root: Path) -> bool:
+    """
+    Copy *src* into its year folder.
+    Returns True on success, False on (logged) error.
+    """
+    try:
+        year = file_year(src) or UNKNOWN_DIR
+        year_dir = dest_root / str(year)
+        with _LOCK:
+            year_dir.mkdir(parents=True, exist_ok=True)
 
-    dest_path = next_non_clashing_path(year_dir / src.name)
-    shutil.copy2(src, dest_path)
-    logging.debug(f"Copied {src} → {dest_path}")
+        dest_path = next_non_clashing_path(year_dir / src.name)
+        shutil.copy2(src, dest_path)
+        logging.debug(f"Copied {src} → {dest_path}")
+        return True
+
+    except Exception as exc:
+        logging.error(f"    Failed to copy {src}  ({exc})")
+        logging.debug("Traceback:", exc_info=True)
+        return False
 
 
 def gather_files(root: Path) -> list[Path]:
-    logging.info(f"Scanning '{root}' ...")
-    wanted = PHOTO_EXTS | VIDEO_EXTS
-    return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in wanted]
+    logging.info("Scanning '%s' ...", root)
+    exts = PHOTO_EXTS | VIDEO_EXTS
+    return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
 
 
-# -------------------------------------------------------------------------------
-# 5. Main
-# -------------------------------------------------------------------------------
+# ---- main ---------------------------------------------------------------------
+import os, signal, sys
+from concurrent.futures import wait, FIRST_COMPLETED, ThreadPoolExecutor
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Copy photos/videos into YYYY folders (multithreaded, Google-Photos aware)."
+        description="Copy photos/videos into YYYY folders "
+        "(multithreaded, Google-Photos aware, robust)."
     )
     ap.add_argument("source_root", type=Path)
     ap.add_argument("dest_root", type=Path)
     ap.add_argument(
-        "-w", "--workers", type=int, default=4, help="Thread pool size (default: 4)"
+        "-w", "--workers", type=int, default=4, help="Thread-pool size (default 4)"
     )
     ap.add_argument(
         "-v",
@@ -226,17 +225,49 @@ def main() -> None:
     if total == 0:
         logging.info("No matching media files found — nothing to do.")
         return
-    logging.info(f"Found {total} media files; copying into '{args.dest_root}' ...")
+    logging.info(f"Found {total} media files; copying into '{args.dest_root}' …")
 
-    lock = threading.Lock()
-    with cf.ThreadPoolExecutor(args.workers) as ex:
-        for i, _ in enumerate(
-            ex.map(lambda p: copy_one(p, args.dest_root, lock), files), 1
-        ):
-            if i % PROGRESS_EVERY == 0 or i == total:
-                logging.info(f"Progress: {i} / {total} files copied")
+    copied = errors = 0
+    futures: dict[cf.Future, Path] = {}
+    # Use a thread-pool executor to copy files in parallel
+    executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=args.workers)
 
-    logging.info("✓ Finished — all files copied.")
+    def _sigint_handler(signo, frame):
+        logging.warning("    Ctrl+C detected — killing all workers…")
+        if executor:
+            executor.shutdown(wait=False, cancel_futures=True)
+        os._exit(130)  # 130 = interrupted by Ctrl-C
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    try:
+        for p in files:
+            fut = executor.submit(copy_one, p, args.dest_root)
+            futures[fut] = p
+
+        pending = set(futures)
+        i = 0
+        while pending:
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for fut in done:
+                i += 1
+                try:
+                    ok = fut.result()
+                    copied += 1 if ok else 0
+                    errors += 0 if ok else 1
+                except Exception as e:
+                    logging.error(f"    Task crashed: {e}")
+                    errors += 1
+
+                if i % PROGRESS_EVERY == 0 or i == total:
+                    logging.info(f"Progress: {i} / {total} processed ({errors} errors)")
+
+    finally:
+        # In normal completion shut the pool down cleanly
+        if executor:
+            executor.shutdown(wait=True)
+
+    logging.info(f"Finished — {copied} copied, {errors} errors.")
 
 
 if __name__ == "__main__":
