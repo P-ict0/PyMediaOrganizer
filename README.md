@@ -72,12 +72,12 @@ python organize_media.py "G:/Camera Roll" "G:/Sorted" -w 8 -v
 
 **Remove Duplicates**
 ```bash
-python deduplicate_media.py <ROOT_DIR> [options]
+python remove_duplicate_media.py <ROOT_DIR> [options]
 ```
 
 Example (delete duplicates for real):
 ```bash
-python deduplicate_media.py "G:/Sorted" --delete --trash "G:/DupTrash" -w 8
+python remove_duplicate_media.py "G:/Sorted" --delete --trash "G:/DupTrash" -w 8
 ```
 
 ## ⚙ Options
@@ -86,5 +86,5 @@ python deduplicate_media.py "G:/Sorted" --delete --trash "G:/DupTrash" -w 8
 |---------|--------|---------|-------------|
 | `-w`, `--workers <N>` | **both** | `4` | Number of concurrent threads (copying / hashing). Increase for SSDs with many small files. |
 | `-v`, `--verbose` | **both** | _off_ | Enable DEBUG-level per-file log output. |
-| `--delete` | **deduplicate** | _dry-run_ | Actually delete or move duplicates (otherwise it just lists them). |
-| `--trash <DIR>` | **deduplicate** | _none_ | Move duplicates into `<DIR>` instead of deleting.<br>Automatically implies `--delete`. |
+| `--delete` | **remove_duplicate_media** | _dry-run_ | Actually delete or move duplicates (otherwise it just lists them). |
+| `--trash <DIR>` | **remove_duplicate_media** | _none_ | Move duplicates into `<DIR>` instead of deleting.<br>Automatically implies `--delete`. |
