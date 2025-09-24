@@ -53,8 +53,8 @@ python deduplicate_media.py "G:/Organized" --delete --trash "G:/DupTrash" -w 8
 No package needed – clone the repo and run:
     
 ```bash
-git clone https://github.com/yourname/media-toolkit.git
-cd media-toolkit
+git clone https://github.com/P-ict0/PyMediaOrganizer.git
+cd PyMediaOrganizer
 python -m pip install pillow
 ```
 
